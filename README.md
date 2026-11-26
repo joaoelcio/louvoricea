@@ -45,3 +45,11 @@ Para operar com contas reais e dados compartilhados:
 - Em Escalas publicadas, use o PDF de um domingo ou escolha um período e exporte em PDF ou Excel.
 
 - Para excluir, use **Gerenciar escalas**. Escalas publicadas podem ser selecionadas e excluídas em lote após confirmação.
+
+- Em **Repertório**, escolha o domingo, cole o link da playlist do Spotify e salve. Use uma playlist acessível aos integrantes. A prévia e o link aparecem na escala publicada.
+
+- Para compartilhar cifras, escolha o domingo em **Repertório**, cole o link da pasta ou arquivo e clique em **Salvar cifras**. O material fica visível junto à escala publicada.
+
+- Em **Repertório**, escolha o domingo e, em **Paleta de roupas**, envie uma imagem JPG, PNG ou WebP. Os integrantes a visualizam no cartão da escala publicada.
+
+- Marque **Pode ser dirigente** no cadastro, atribua **Dirigente** no rascunho e publique. O dirigente poderá editar a playlist pelo cartão daquele domingo.

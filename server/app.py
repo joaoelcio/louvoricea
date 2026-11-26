@@ -1,5 +1,7 @@
 """API SQLite para Escala do Louvor, sem dependências externas."""
 from contextlib import closing
+from base64 import b64decode
+from binascii import Error as Base64Error
 from datetime import date
 from hashlib import pbkdf2_hmac, sha256
 from hmac import compare_digest
@@ -12,6 +14,7 @@ import sqlite3
 import time
 import unicodedata
 from pathlib import Path
+from urllib.parse import urlsplit
 
 DB = os.environ.get("LOUVOR_DB", "louvor.sqlite")
 ORIGIN = os.environ.get("LOUVOR_ORIGIN", "http://localhost:8765")
@@ -63,6 +66,7 @@ def init():
             CREATE TABLE IF NOT EXISTS availability (
               person TEXT, month TEXT, dates TEXT NOT NULL, PRIMARY KEY(person,month)
             );
+            CREATE TABLE IF NOT EXISTS palette (day TEXT PRIMARY KEY, image TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS schedule (
               id INTEGER PRIMARY KEY, version INTEGER NOT NULL, data TEXT NOT NULL
             );
@@ -162,7 +166,13 @@ def verified_day(day, key, people, available, roles):
     talk = day["talk"]
     if talk and (talk not in assignments or not people[talk]["talk"] or any(role.startswith("Vocal • ") for role in assignments[talk])):
         raise Invalid("O talkback exige um músico habilitado escalado somente no instrumento.")
-    return dict(date=key,slots=public_slots,talkName=people[talk]["name"] if talk else "")
+    director = day.get("director", "")
+    if director:
+        person = people.get(director)
+        if not person or not person["active"] or not person.get("directorEligible") or key not in available.get(director, []):
+            raise Invalid("O dirigente precisa estar habilitado e disponível nesse domingo.")
+    return dict(date=key,slots=public_slots,talkName=people[talk]["name"] if talk else "",
+                director=director,directorName=people[director]["name"] if director else "")
 
 
 def save_schedule(db, body):
@@ -176,6 +186,25 @@ def save_schedule(db, body):
     if not set(previous.get("customInstruments", [])) <= instruments:
         raise Invalid("O catálogo deve manter os instrumentos já cadastrados.")
     data["customInstruments"] = custom
+    playlists = body.get("playlists", previous.get("playlists", {}))
+    if not isinstance(playlists, dict):
+        raise Invalid("Repertório inválido.")
+    for day, url in playlists.items():
+        sunday(day)
+        if not isinstance(url, str) or not re.fullmatch(r"https://open\.spotify\.com/playlist/[A-Za-z0-9]{22}", url):
+            raise Invalid("Informe um link de playlist do Spotify.")
+    data["playlists"] = playlists
+    chords = body.get("chords", previous.get("chords", {}))
+    if not isinstance(chords, dict):
+        raise Invalid("Cifras inválidas.")
+    for day, url in chords.items():
+        sunday(day)
+        if not isinstance(url,str) or len(url) > 2048 or any(char.isspace() for char in url):
+            raise Invalid("Informe um link HTTPS válido para as cifras.")
+        address = urlsplit(url)
+        if address.scheme != "https" or not address.hostname or address.username is not None:
+            raise Invalid("Informe um link HTTPS válido para as cifras.")
+    data["chords"] = chords
     roles = ROLES | instruments
     check_formation(data["formation"], roles)
     for key, value in data["exceptions"].items():
@@ -194,6 +223,38 @@ def save_schedule(db, body):
         raise Invalid("Publique apenas domingos com rascunho salvo.")
     data["published"] = published
     db.execute("UPDATE schedule SET data=?,version=version+1 WHERE id=1",(pack(data),))
+
+
+def save_director_playlist(db, body, profile):
+    day, url = body["date"], body["url"]
+    sunday(day)
+    row = db.execute("SELECT data FROM schedule WHERE id=1").fetchone()
+    state = json.loads(row["data"])
+    scheduled = state["published"].get(day, {})
+    if not profile.get("directorEligible") or scheduled.get("director") != profile["id"]:
+        raise Invalid("A edição é permitida ao dirigente escalado para este domingo.",403)
+    if not isinstance(url,str) or not re.fullmatch(r"https://open\.spotify\.com/playlist/[A-Za-z0-9]{22}",url):
+        raise Invalid("Informe um link de playlist do Spotify.")
+    state.setdefault("playlists", {})[day] = url
+    db.execute("UPDATE schedule SET data=?,version=version+1 WHERE id=1",(pack(state),))
+
+
+def save_palette(db, body):
+    day, image = body["date"], body["image"]
+    sunday(day)
+    if image is None:
+        db.execute("DELETE FROM palette WHERE day=?", (day,))
+        return
+    prefix = "data:image/jpeg;base64,"
+    if not isinstance(image,str) or len(image)>1_500_000 or not image.startswith(prefix):
+        raise Invalid("Imagem da paleta inválida.")
+    try:
+        raw = b64decode(image[len(prefix):], validate=True)
+    except Base64Error as error:
+        raise Invalid("Imagem da paleta inválida.") from error
+    if not raw.startswith(bytes.fromhex("FFD8FF")) or not raw.endswith(bytes.fromhex("FFD9")):
+        raise Invalid("Imagem da paleta inválida.")
+    db.execute("INSERT OR REPLACE INTO palette VALUES(?,?)", (day,image))
 
 
 def delete_schedules(db, body):
@@ -218,6 +279,7 @@ def save_person(db, body, admin):
     if (old and json.loads(old["profile"])["role"] != "integrante" and not admin) or body["role"] not in ({"lider","integrante"} if admin else {"integrante"}):
         raise Invalid("Você não pode editar este perfil.",403)
     profile = {key:body[key] for key in ("id","name","email","role","voice","instruments","talk","active")}
+    profile["directorEligible"] = body.get("directorEligible") is True
     profile["email"] = profile["email"].strip().lower()
     profile["name"] = profile["name"].strip()
     if not 1 <= len(profile["name"]) <= 120 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", profile["email"]):
@@ -338,15 +400,31 @@ class Handler(BaseHTTPRequestHandler):
         profile = json.loads(row["profile"])
         admin = profile["role"] == "admin"
         leader = admin or profile["role"] == "lider"
+        if not post and path.startswith("palette/"):
+            day = path.split("/",1)[1]
+            sunday(day)
+            record = db.execute("SELECT data FROM schedule WHERE id=1").fetchone()
+            if row["force"] or (not leader and day not in json.loads(record["data"])["published"]):
+                raise Invalid("Você não tem acesso a essa paleta.",403)
+            palette = db.execute("SELECT image FROM palette WHERE day=?",(day,)).fetchone()
+            if not palette:
+                raise Invalid("Imagem da paleta não encontrada.",404)
+            return {"image":palette["image"]}
         if not post and path == "state":
             record = db.execute("SELECT * FROM schedule WHERE id=1").fetchone()
             state = json.loads(record["data"])
             if not leader or row["force"]:
-                state = {"published": {} if row["force"] else state["published"]}
+                published = {} if row["force"] else state["published"]
+                playlists = {day:url for day,url in state.get("playlists", {}).items() if day in published}
+                chords = {day:url for day,url in state.get("chords", {}).items() if day in published}
+                state = {"published":published,"playlists":playlists,"chords":chords}
             if not row["force"]:
                 state["availability"],state["responded"] = availability(db,None if leader else row["id"])
                 if leader:
                     state["people"] = [json.loads(item["profile"]) for item in db.execute("SELECT profile FROM person")]
+            if not row["force"]:
+                state["palettes"] = {item["day"]:True for item in db.execute("SELECT day FROM palette")
+                                     if leader or item["day"] in state["published"]}
             state["version"] = record["version"]
             return {"me": {**profile,"force":bool(row["force"])},"state":state}
         if not post:
@@ -372,6 +450,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise Invalid("A data está fora do mês selecionado.")
             db.execute("INSERT OR REPLACE INTO availability VALUES(?,?,?)", (row["id"],month,pack(sorted(set(dates)))))
             db.execute("UPDATE schedule SET version=version+1 WHERE id=1")
+        elif path == "director-playlist":
+            save_director_playlist(db,body,profile)
+        elif path == "palette" and leader:
+            save_palette(db,body)
         elif path == "schedule" and leader:
             save_schedule(db,body)
         elif path == "delete-schedules" and leader:

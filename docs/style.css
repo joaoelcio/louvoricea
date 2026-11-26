@@ -129,3 +129,11 @@ small { color: var(--muted); }
   .manage-row { grid-template-columns: minmax(0, 1fr); }
   .manage-row button { justify-self: start; }
 }
+
+.playlist { margin-top: 14px; }
+.playlist a { display: inline-block; color: var(--blue); font-weight: 650; margin-bottom: 8px; }
+.playlist iframe { display: block; width: 100%; height: 352px; border: 0; border-radius: 12px; }
+
+.palette { margin-top: 14px; }
+.palette img { width: 100%; max-height: 540px; object-fit: contain; object-position: left center; border-radius: 12px; }
+.palette img:not([src]) { display: none; }

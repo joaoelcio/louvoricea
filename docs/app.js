@@ -68,6 +68,7 @@ async function load() {
     const result = await api('state');
     me = result.me;
     state = result.state;
+    paletteCache.clear();
   } else {
     state = JSON.parse(localStorage.getItem('louvor-demo-v1')) || demoData();
   }
@@ -82,8 +83,8 @@ async function save(next) {
   }
 }
 function nav() {
-  const labels = privileged() ? {review:'Revisar escala',formation:'Formação',people:'Integrantes',published:'Escalas publicadas',availability:'Disponibilidade',manage:'Gerenciar escalas'} : {availability:'Disponibilidade',published:'Escalas publicadas'};
-  const icons = {review:'▤',formation:'◫',people:'♙',published:'▦',availability:'✓',manage:'⋯'};
+  const labels = privileged() ? {review:'Revisar escala',formation:'Formação',people:'Integrantes',published:'Escalas publicadas',availability:'Disponibilidade',manage:'Gerenciar escalas',repertoire:'Repertório'} : {availability:'Disponibilidade',published:'Escalas publicadas'};
+  const icons = {review:'▤',formation:'◫',people:'♙',published:'▦',availability:'✓',manage:'⋯',repertoire:'♫'};
   $('#nav').innerHTML = me && !me.force ? Object.entries(labels).map(([id,label]) => `<button data-action="nav/${id}" aria-current="${page === id}"><span class="nav-icon" aria-hidden="true">${icons[id]}</span>${label}</button>`).join('') : '';
   $('#layout').classList.toggle('full',!me || me.force);
   $('#account').innerHTML = me ? `<span>${esc(me.name)}</span> ${me.force || !API_URL ? '' : button('password','Senha')} ${button('logout','Sair')}` : '';
@@ -108,8 +109,111 @@ function eventHeader(date,status) {
   const month = dateText(date,{month:'short'}).replace('.','');
   return `<div class="event-header"><div class="event-date" aria-hidden="true"><strong>${day}</strong><span>${month}</span></div><div><h2>Culto de domingo</h2><time datetime="${date}">${dateText(date)}</time></div><span class="badge ${status === 'Rascunho' ? 'draft' : ''}">${status}</span></div>`;
 }
+function spotifyUrl(value) {
+  if (!value.trim()) return '';
+  let url;
+  try { url = new URL(value.trim()); }
+  catch { throw new Error('Cole o link de uma playlist do Spotify.'); }
+  const match = url.pathname.match(/^\/(?:intl-[a-z-]+\/)?playlist\/([a-zA-Z0-9]{22})\/?$/);
+  if (url.origin !== 'https://open.spotify.com' || url.username || url.password || !match) {
+    throw new Error('Cole um link de playlist de open.spotify.com.');
+  }
+  return 'https://open.spotify.com/playlist/'+match[1];
+}
+function playlistPreview(date) {
+  const url = state.playlists?.[date];
+  if (!url) return '';
+  return `<section class="playlist"><h3>Playlist do culto</h3><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">Abrir no Spotify</a>
+    <iframe title="Prévia da playlist de ${dateText(date)}" src="${esc(url.replace('/playlist/','/embed/playlist/'))}" loading="lazy" allow="encrypted-media; fullscreen; picture-in-picture" allowfullscreen></iframe></section>`;
+}
+function chordsLink(date) {
+  const url = state.chords?.[date];
+  return url ? `<section class="playlist"><h3>Cifras do culto</h3><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">Abrir cifras</a></section>` : '';
+}
+function paletteSection(date) {
+  if (!Object.hasOwn(state.palettes || {},date)) return '';
+  const image = API_URL ? `data-palette="${date}"` : `src="${esc(state.palettes[date])}"`;
+  return `<section class="palette"><h3>Paleta de roupas</h3><img ${image} alt="Paleta de cores das roupas para o culto de ${dateText(date)}"><p class="palette-error" hidden>Não foi possível carregar a imagem da paleta.</p></section>`;
+}
+const paletteCache = new Map();
+async function showPalette(image) {
+  const date = image.dataset.palette;
+  try {
+    if (!paletteCache.has(date)) {
+      paletteCache.set(date,api('palette/'+date).catch(error => {
+        paletteCache.delete(date);
+        throw error;
+      }));
+    }
+    image.src = (await paletteCache.get(date)).image;
+  } catch {
+    image.hidden = true;
+    image.nextElementSibling.hidden = false;
+  }
+}
+async function preparePalette(file) {
+  if (!file?.size || !['image/png','image/jpeg','image/webp'].includes(file.type)) {
+    throw new Error('Escolha uma imagem PNG, JPG ou WebP.');
+  }
+  if (file.size > 12_000_000) throw new Error('Escolha uma imagem de até 12 MB.');
+  let bitmap;
+  try { bitmap = await createImageBitmap(file); }
+  catch { throw new Error('Não foi possível abrir a imagem selecionada.'); }
+  const scale = Math.min(1,1000 / Math.max(bitmap.width,bitmap.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1,Math.round(bitmap.width*scale));
+  canvas.height = Math.max(1,Math.round(bitmap.height*scale));
+  const ctx = canvas.getContext('2d',{alpha:false});
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(bitmap,0,0,canvas.width,canvas.height);
+  bitmap.close();
+  return canvas.toDataURL('image/jpeg',.82);
+}
+async function savePalette(date,image) {
+  if (API_URL) {
+    await api('palette',{date,image});
+    paletteCache.delete(date);
+    await load();
+  } else {
+    const next = structuredClone(state);
+    next.palettes ??= {};
+    if (image) next.palettes[date] = image;
+    else delete next.palettes[date];
+    await save(next);
+  }
+}
+function repertoireView() {
+  if (!privileged()) return '';
+  selected ||= nextSunday;
+  const dates = [...new Set([...Object.keys(state.playlists || {}),...Object.keys(state.chords || {}),...Object.keys(state.palettes || {})])].sort();
+  return heading('Repertório','Organize a playlist, as cifras e a paleta de roupas de cada domingo.') +
+    `<form id="playlist" class="card"><label>Domingo<input id="playlist-date" type="date" name="date" value="${selected}" required></label>
+    ${dates.length ? `<label>Domingos com repertório<select id="playlist-saved">${option('','Escolha uma data',selected)}${dates.map(date => option(date,dateText(date),selected)).join('')}</select></label>` : ''}
+    <label>Link da playlist<input type="url" name="url" value="${esc(state.playlists?.[selected])}" placeholder="https://open.spotify.com/playlist/…"></label>
+    <div class="row"><button class="primary">Salvar playlist</button>${state.playlists?.[selected] ? button('remove-playlist','Remover playlist') : ''}</div>
+    <small>Os integrantes verão a playlist junto da escala publicada desse domingo.</small></form>
+    <form id="chords" class="card"><h2>Cifras do culto</h2>
+    <label>Link da pasta ou arquivo<input type="url" name="url" maxlength="2048" value="${esc(state.chords?.[selected])}" required></label>
+    <small>Cole um link HTTPS de uma pasta do Drive, PDF ou documento. Confira se os integrantes têm acesso ao material.</small>
+    <div class="row"><button class="primary">Salvar cifras</button>${state.chords?.[selected] ? button('remove-chords','Remover cifras') : ''}</div></form>
+    <form id="palette" class="card"><h2>Paleta de roupas</h2>
+    <label>Imagem da paleta<input type="file" name="image" accept="image/png,image/jpeg,image/webp" required></label>
+    <small>A imagem será exibida no cartão do culto depois que a escala for publicada.</small>
+    <div class="row"><button class="primary">Salvar imagem</button>${state.palettes?.[selected] ? button('remove-palette','Remover imagem') : ''}</div>
+    ${paletteSection(selected)}</form>
+    ${state.chords?.[selected] ? `<div class="card">${chordsLink(selected)}</div>` : ''}
+    ${state.playlists?.[selected] ? `<div class="card">${playlistPreview(selected)}</div>` : ''}`;
+}
+function directorPlaylistForm(day) {
+  if (!me?.directorEligible || day.director !== me.id) return '';
+  return `<form class="director-playlist" data-director-playlist><h3>Editar playlist do culto</h3>
+    <input type="hidden" name="date" value="${day.date}">
+    <label>Link da playlist<input type="url" name="url" value="${esc(state.playlists?.[day.date])}" required></label>
+    <div><button class="primary">Salvar playlist</button></div></form>`;
+}
 function readable(day) {
-  return `<section class="card event-card">${eventHeader(day.date,'Publicada')}${day.slots.map(slot => line(slot.role,slot.name)).join('')}${line('Talkback',day.talkName)}</section>`;
+  return `<section class="card event-card">${eventHeader(day.date,'Publicada')}${day.slots.map(slot => line(slot.role,slot.name)).join('')}${day.directorName ? line('Dirigente',day.directorName) : ''}${line('Talkback',day.talkName)}${directorPlaylistForm(day)}${playlistPreview(day.date)}${chordsLink(day.date)}${paletteSection(day.date)}</section>`;
 }
 function publishedView() {
   const days = Object.values(state.published).sort((a,b) => a.date.localeCompare(b.date));
@@ -202,7 +306,7 @@ function peopleView() {
   return heading('Integrantes','Gerencie os cadastros e as funções da banda.') +
     `<div class="card"><form id="filter" class="row"><label>Buscar integrante<input name="query" type="search" value="${esc(filter)}"></label><button>Buscar</button></form>${list.map(row).join('') || '<p>Nenhum integrante encontrado.</p>'}</div>
     <form id="person" class="card"><h2>${current ? 'Editar integrante' : 'Cadastrar integrante'}</h2><div class="grid"><label>Nome<input name="name" maxlength="120" value="${esc(current?.name)}" required></label><label>E-mail<input name="email" type="email" value="${esc(current?.email)}" required></label><label>Perfil<select name="role">${options.map(([id,name]) => option(id,name,current?.role)).join('')}</select></label><label>Classificação vocal<select name="voice">${option('','Sem função vocal',current?.voice)}${voices.map(voice => option(voice,voice,current?.voice)).join('')}</select></label></div>
-    <fieldset><legend>Instrumentos</legend>${instrumentCatalog().map(role => `<label class="inline"><input type="checkbox" name="instrument" value="${esc(role)}"${current?.instruments.includes(role) ? ' checked' : ''}>${esc(roleLabel(role))}</label>`).join('')}</fieldset><label class="inline"><input type="checkbox" name="talk"${current?.talk ? ' checked' : ''}>Pode fazer talkback</label>${API_URL && !current ? '<label>Senha temporária<input name="password" type="password" minlength="8" required autocomplete="new-password"></label>' : ''}<label class="inline"><input type="checkbox" name="active"${current?.active === false ? '' : ' checked'}>Conta ativa</label><div class="row"><button class="primary">Salvar cadastro</button>${current ? button('new','Cancelar edição') : ''}</div></form>`;
+    <fieldset><legend>Instrumentos</legend>${instrumentCatalog().map(role => `<label class="inline"><input type="checkbox" name="instrument" value="${esc(role)}"${current?.instruments.includes(role) ? ' checked' : ''}>${esc(roleLabel(role))}</label>`).join('')}</fieldset><label class="inline"><input type="checkbox" name="talk"${current?.talk ? ' checked' : ''}>Pode fazer talkback</label>${API_URL && !current ? '<label>Senha temporária<input name="password" type="password" minlength="8" required autocomplete="new-password"></label>' : ''}<label class="inline"><input type="checkbox" name="directorEligible"${current?.directorEligible ? ' checked' : ''}>Pode ser dirigente</label><label class="inline"><input type="checkbox" name="active"${current?.active === false ? '' : ' checked'}>Conta ativa</label><div class="row"><button class="primary">Salvar cadastro</button>${current ? button('new','Cancelar edição') : ''}</div></form>`;
 }
 function reviewView() {
   const dates = Object.keys(state.drafts).sort();
@@ -215,22 +319,23 @@ function reviewView() {
   }).join('');
   return heading('Revisar escala','Gere a programação de domingos e confira a formação antes de publicar.') +
     `<form id="generate" class="card"><h2>Gerar escala</h2><div class="row"><label>Primeiro domingo<input type="date" name="start" value="${nextSunday}" required></label><label>Quantidade de domingos<input type="number" name="count" value="8" min="1" max="52" required></label><button class="primary">Gerar rascunho</button></div></form>` +
-    (day ? `<section class="card event-card">${eventHeader(day.date,'Rascunho')}<div class="row toolbar event-controls"><label>Selecionar domingo<select id="review-date">${dates.map(date => option(date,dateText(date),selected)).join('')}</select></label></div>${slots}<div class="slot"><strong>Talkback</strong><select data-slot="talk" aria-label="Talkback">${option('','Vaga em aberto',day.talk)}${talkback(day,state.people).map(person => option(person.id,person.name,day.talk)).join('')}</select></div>${pending.length ? `<p><small>Ainda sem disponibilidade informada para este dia: ${esc(pending.map(person => person.name).join(', '))}</small></p>` : ''}<div class="row">${button('publish-day','Publicar domingo',true)}${button('publish-all','Publicar todos os rascunhos')}</div></section>` : '<p>Os rascunhos aparecem aqui depois da geração.</p>');
+    (day ? `<section class="card event-card">${eventHeader(day.date,'Rascunho')}<div class="row toolbar event-controls"><label>Selecionar domingo<select id="review-date">${dates.map(date => option(date,dateText(date),selected)).join('')}</select></label></div>${slots}<div class="slot"><strong>Dirigente</strong><select data-slot="director" aria-label="Dirigente">${option('','Vaga em aberto',day.director || '')}${state.people.filter(p => p.id === day.director || (p.active && p.directorEligible && state.availability[p.id]?.includes(day.date))).map(p => option(p.id,p.name,day.director)).join('')}</select></div><div class="slot"><strong>Talkback</strong><select data-slot="talk" aria-label="Talkback">${option('','Vaga em aberto',day.talk)}${talkback(day,state.people).map(person => option(person.id,person.name,day.talk)).join('')}</select></div>${pending.length ? `<p><small>Ainda sem disponibilidade informada para este dia: ${esc(pending.map(person => person.name).join(', '))}</small></p>` : ''}<div class="row">${button('publish-day','Publicar domingo',true)}${button('publish-all','Publicar todos os rascunhos')}</div></section>` : '<p>Os rascunhos aparecem aqui depois da geração.</p>');
 }
 function passwordView() {
   return `<section class="card login">${heading('Alterar senha','Use no mínimo 8 caracteres.') }<form id="password"><label>Senha atual<input name="current" type="password" autocomplete="current-password" required></label><label>Nova senha<input name="password" type="password" minlength="8" autocomplete="new-password" required></label><button class="primary">Salvar nova senha</button></form></section>`;
 }
 function render() {
   nav();
-  const views = {manage:manageView,availability:availabilityView,published:publishedView,formation:formationView,people:peopleView,review:reviewView,password:passwordView};
+  const views = {repertoire:repertoireView,manage:manageView,availability:availabilityView,published:publishedView,formation:formationView,people:peopleView,review:reviewView,password:passwordView};
   main.innerHTML = !me ? loginScreen() : me.force ? passwordView() : (views[page] || availabilityView)();
+  main.querySelectorAll('[data-palette]').forEach(showPalette);
 }
 function defaultPage() { page = privileged() ? 'review' : 'availability'; }
 function validateSunday(date) {
   if (new Date(date+'T12:00:00Z').getUTCDay() !== 0) throw new Error('Selecione uma data que caia no domingo.');
 }
 function publication(day) {
-  return {date:day.date,slots:day.slots.map(slot => ({role:slot.role,name:personName(slot.person),isTalkback:Boolean(day.talk && slot.person === day.talk && !isVocal(slot.role))})),talkName:personName(day.talk)};
+  return {date:day.date,slots:day.slots.map(slot => ({role:slot.role,name:personName(slot.person),isTalkback:Boolean(day.talk && slot.person === day.talk && !isVocal(slot.role))})),talkName:personName(day.talk),director:day.director || '',directorName:personName(day.director)};
 }
 function download(blob,filename) {
   const url = URL.createObjectURL(blob);
@@ -248,15 +353,17 @@ function exportSlots(day,talkLabel = 'Talkback') {
   if (talkIndex === -1 && day.talkName) {
     talkIndex = day.slots.findIndex(slot => !isVocal(slot.role) && slot.name === day.talkName);
   }
-  return day.slots.map((slot,index) => ({
+  const slots = day.slots.map((slot,index) => ({
     role:slot.role,
     name:(slot.name || 'Vaga em aberto') + (index === talkIndex ? ' ('+talkLabel+')' : '')
   }));
+  if (day.directorName) slots.unshift({role:'Dirigente',name:day.directorName});
+  return slots;
 }
 function pdf(days) {
   const sections = days.map(day => ({
     title:dateText(day.date),
-    lines:exportSlots(day).map(slot => roleLabel(slot.role)+' — '+slot.name)
+    rows:exportSlots(day).map(slot => ({role:roleLabel(slot.role),name:slot.name}))
   }));
   const period = days.length === 1 ? days[0].date : days[0].date+'-a-'+days.at(-1).date;
   download(pdfDocument(sections),'escala-'+period+'.pdf');
@@ -273,7 +380,7 @@ function excel(days) {
     }
     return groups;
   });
-  const roles = [...totals.keys()].sort((a,b) => Number(isVocal(b))-Number(isVocal(a)));
+  const roles = [...totals.keys()].sort((a,b) => Number(b === 'Dirigente')-Number(a === 'Dirigente') || Number(isVocal(b))-Number(isVocal(a)));
   const rows = [];
   let vocalNumber = 0;
   for (const role of roles) {
@@ -305,6 +412,7 @@ async function handleAction(action) {
       defaultPage();
       break;
     case 'logout':
+      paletteCache.clear();
       if (API_URL) await api('logout',{});
       sessionStorage.removeItem('louvor-token');
       token = ''; me = null; state = empty(); loginRole = '';
@@ -316,6 +424,27 @@ async function handleAction(action) {
     case 'password': page = 'password'; break;
     case 'edit': edit = value; break;
     case 'new': edit = ''; break;
+    case 'remove-palette':
+      if (!privileged() || !state.palettes?.[selected]) return;
+      await savePalette(selected,null);
+      notify('Imagem removida.');
+      break;
+    case 'remove-chords': {
+      if (!privileged() || !state.chords?.[selected]) return;
+      const next = structuredClone(state);
+      delete next.chords[selected];
+      await save(next);
+      notify('Link das cifras removido.');
+      break;
+    }
+    case 'remove-playlist': {
+      if (!privileged() || !state.playlists?.[selected]) return;
+      const next = structuredClone(state);
+      delete next.playlists[selected];
+      await save(next);
+      notify('Playlist removida.');
+      break;
+    }
     case 'formation-default': formationMode = 'default'; break;
     case 'formation-specific': formationMode = 'specific'; break;
     case 'formation-reset': {
@@ -364,6 +493,23 @@ async function handleAction(action) {
 async function handleSubmit(form,submitter) {
   const data = new FormData(form);
   const next = structuredClone(state);
+  if (form.hasAttribute('data-director-playlist')) {
+    const date = data.get('date');
+    if (!me?.directorEligible || state.published[date]?.director !== me.id) return;
+    const url = spotifyUrl(data.get('url'));
+    if (!url) throw new Error('Informe o link da playlist.');
+    if (API_URL) {
+      await api('director-playlist',{date,url});
+      await load();
+    } else {
+      next.playlists ??= {};
+      next.playlists[date] = url;
+      await save(next);
+    }
+    notify('Playlist salva.');
+    render();
+    return;
+  }
   switch (form.id) {
     case 'login': {
       const result = await api('login',Object.fromEntries(data));
@@ -397,6 +543,40 @@ async function handleSubmit(form,submitter) {
       notify('Disponibilidade salva.');
       break;
     }
+    case 'palette':
+      if (!privileged()) return;
+      validateSunday(selected);
+      await savePalette(selected,await preparePalette(data.get('image')));
+      notify('Imagem da paleta salva.');
+      break;
+    case 'chords': {
+      if (!privileged()) return;
+      validateSunday(selected);
+      let url;
+      try { url = new URL(data.get('url').trim()); }
+      catch { throw new Error('Informe um link HTTPS válido para as cifras.'); }
+      if (url.protocol !== 'https:' || url.username || url.password || url.href.length > 2048) {
+        throw new Error('Informe um link HTTPS válido para as cifras.');
+      }
+      next.chords ??= {};
+      next.chords[selected] = url.href;
+      await save(next);
+      notify('Link das cifras salvo.');
+      break;
+    }
+    case 'playlist': {
+      if (!privileged()) return;
+      const date = data.get('date');
+      validateSunday(date);
+      const url = spotifyUrl(data.get('url'));
+      if (!url) throw new Error('Informe o link da playlist.');
+      next.playlists ??= {};
+      next.playlists[date] = url;
+      await save(next);
+      selected = date;
+      notify('Playlist salva.');
+      break;
+    }
     case 'formation': {
       const formation = Object.fromEntries([...data].map(([role,count]) => [role,Number(count)]));
       if (formationMode === 'specific') { validateSunday(formationDate); next.exceptions[formationDate] = formation; }
@@ -417,7 +597,7 @@ async function handleSubmit(form,submitter) {
       break;
     }
     case 'person': {
-      const person = {id:edit || crypto.randomUUID(),name:data.get('name').trim(),email:data.get('email').trim(),role:data.get('role'),voice:data.get('voice'),instruments:data.getAll('instrument'),talk:data.has('talk'),active:data.has('active')};
+      const person = {id:edit || crypto.randomUUID(),name:data.get('name').trim(),email:data.get('email').trim(),role:data.get('role'),voice:data.get('voice'),instruments:data.getAll('instrument'),talk:data.has('talk'),directorEligible:data.has('directorEligible'),active:data.has('active')};
       if (person.talk && !person.instruments.length) throw new Error('Selecione pelo menos um instrumento para habilitar o talkback.');
       if (API_URL) {
         await api('person',{...person,password:data.get('password')});
@@ -466,6 +646,15 @@ async function handleSubmit(form,submitter) {
   render();
 }
 async function handleChange(target) {
+  if (target.id === 'playlist-date' || target.id === 'playlist-saved') {
+    if (!target.value) return;
+    try { validateSunday(target.value); }
+    catch (error) { target.value = selected; throw error; }
+    selected = target.value;
+    render();
+    return;
+  }
+
   if (target.id === 'month') { if (target.value) month = target.value; render(); return; }
   if (target.id === 'formation-date' || target.id === 'formation-saved') {
     try { if (target.value) validateSunday(target.value); }
@@ -476,7 +665,8 @@ async function handleChange(target) {
   if (!target.matches('[data-slot]')) return;
   const next = structuredClone(state);
   const day = next.drafts[selected];
-  if (target.dataset.slot === 'talk') day.talk = target.value;
+  if (target.dataset.slot === 'director') day.director = target.value;
+  else if (target.dataset.slot === 'talk') day.talk = target.value;
   else {
     const index = Number(target.dataset.slot);
     const previous = day.slots[index].person;
@@ -513,7 +703,7 @@ document.addEventListener('submit',event => {
 });
 document.addEventListener('change',event => {
   if (event.target.matches('#mark-all-published,[name="publishedDate"]')) updatePublishedSelection(event.target);
-  if (event.target.matches('#month,#formation-date,#formation-saved,#review-date,[data-slot]')) run(() => handleChange(event.target));
+  if (event.target.matches('#playlist-date,#playlist-saved,#month,#formation-date,#formation-saved,#review-date,[data-slot]')) run(() => handleChange(event.target));
 });
 if (API_URL && token) {
   try { await load(); defaultPage(); }
